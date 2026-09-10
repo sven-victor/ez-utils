@@ -1,0 +1,369 @@
+// Package redis provides a Redis client with JSON configuration, TLS support,
+// OpenTelemetry tracing, and helpers for iterating Redis sets.
+package redis
+
+import (
+	"bytes"
+	"context"
+	"encoding"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"time"
+
+	"github.com/go-kit/log/level"
+	"github.com/go-redis/redis"
+	"github.com/gogo/protobuf/jsonpb"
+	"github.com/pkg/errors"
+	"github.com/prometheus/common/model"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/sven-victor/ez-utils/clients/tls"
+	"github.com/sven-victor/ez-utils/log"
+	"github.com/sven-victor/ez-utils/safe"
+	"github.com/sven-victor/ez-utils/signals"
+	w "github.com/sven-victor/ez-utils/wrapper"
+)
+
+// Client is a Redis handle that traces commands and round-trips Options as JSON.
+// Construct one with NewClient, or unmarshal JSON into Client to connect.
+type Client struct {
+	client  *redis.Client
+	options *Options
+}
+
+// MarshalJSONPB encodes the Redis options for protobuf JSON.
+func (r Client) MarshalJSONPB(_ *jsonpb.Marshaler) ([]byte, error) {
+	return r.MarshalJSON()
+}
+
+// MarshalJSON encodes the Redis options.
+func (r Client) MarshalJSON() ([]byte, error) {
+	return json.Marshal(r.options)
+}
+
+// UnmarshalJSON decodes Options and opens a new Redis connection.
+func (r *Client) UnmarshalJSON(data []byte) (err error) {
+	if r.options == nil {
+		r.options = &Options{}
+	}
+	if err = json.Unmarshal(data, r.options); err != nil {
+		return err
+	}
+	if r.client, err = NewRedisClient(context.Background(), r.options); err != nil {
+		return err
+	}
+	return
+}
+
+// Options configures a Redis client. UnmarshalJSON accepts either a Redis URL
+// string or a JSON object. URL is required for the object form; other fields
+// override values parsed from the URL.
+type Options struct {
+	o *redis.Options
+	// URL is a Redis connection URL such as redis://host:6379/0.
+	URL string `json:"url,omitempty"`
+	// Password overrides the password from URL when set.
+	Password safe.String `json:"password"`
+	// Database to be selected after connecting to the server.
+	DB *int `json:"db"`
+
+	// Maximum number of retries before giving up.
+	// Default is to not retry failed commands.
+	MaxRetries *int `json:"max_retries"`
+	// Minimum backoff between each retry.
+	// Default is 8 milliseconds; -1 disables backoff.
+	MinRetryBackoff *model.Duration `json:"min_retry_backoff"`
+	// Maximum backoff between each retry.
+	// Default is 512 milliseconds; -1 disables backoff.
+	MaxRetryBackoff *model.Duration `json:"max_retry_backoff"`
+
+	// Dial timeout for establishing new connections.
+	// Default is 5 seconds.
+	DialTimeout *model.Duration `json:"dial_timeout"`
+	// Timeout for socket reads. If reached, commands will fail
+	// with a timeout instead of blocking. Use value -1 for no timeout and 0 for default.
+	// Default is 3 seconds.
+	ReadTimeout *model.Duration `json:"read_timeout"`
+	// Timeout for socket writes. If reached, commands will fail
+	// with a timeout instead of blocking.
+	// Default is ReadTimeout.
+	WriteTimeout *model.Duration `json:"write_timeout"`
+
+	// Maximum number of socket connections.
+	// Default is 10 connections per every CPU as reported by runtime.NumCPU.
+	PoolSize *int `json:"pool_size"`
+	// Minimum number of idle connections which is useful when establishing
+	// new connection is slow.
+	MinIdleConns *int `json:"min_idle_conns"`
+	// Connection age at which client retires (closes) the connection.
+	// Default is to not close aged connections.
+	MaxConnAge *time.Duration `json:"max_conn_age"`
+	// Amount of time client waits for connection if all connections
+	// are busy before returning an error.
+	// Default is ReadTimeout + 1 second.
+	PoolTimeout *time.Duration `json:"pool_timeout"`
+	// Amount of time after which client closes idle connections.
+	// Should be less than server's timeout.
+	// Default is 5 minutes. -1 disables idle timeout check.
+	IdleTimeout *time.Duration `json:"idle_timeout"`
+	// Frequency of idle checks made by idle connections reaper.
+	// Default is 1 minute. -1 disables idle connections reaper,
+	// but idle connections are still discarded by the client
+	// if IdleTimeout is set.
+	IdleCheckFrequency *time.Duration `json:"idle_check_frequency"`
+	// TLSConfig is used for TLS connections to Redis.
+	TLSConfig *tls.TLSOptions `json:"tls_config" yaml:"tls_config" mapstructure:"tls_config"`
+}
+
+// UnmarshalJSON accepts a JSON string Redis URL or a JSON object. Object fields
+// override corresponding values parsed from URL.
+func (o *Options) UnmarshalJSON(data []byte) (err error) {
+	if len(data) > 0 && data[0] == '"' {
+		if err = json.Unmarshal(data, &o.URL); err != nil {
+			return err
+		}
+		o.o, err = redis.ParseURL(o.URL)
+		if err != nil {
+			return fmt.Errorf("failed to parse redis url: %s", err)
+		}
+		return o.Password.SetValue(w.DefaultString(o.Password.String(), o.o.Password))
+	}
+	type plain Options
+	err = json.Unmarshal(data, (*plain)(o))
+	if err != nil {
+		return err
+	}
+	o.o, err = redis.ParseURL(o.URL)
+	if err != nil {
+		return fmt.Errorf("failed to parse redis url: %s", err)
+	}
+	if err = o.Password.SetValue(w.DefaultString(o.Password.String(), o.o.Password)); err != nil {
+		return err
+	}
+	o.o.DB = *w.DefaultPointer(o.DB, &o.o.DB)
+	o.o.MaxRetries = *w.DefaultPointer(o.MaxRetries, &o.o.MaxRetries)
+	o.o.MinRetryBackoff = *w.DefaultPointer[time.Duration]((*time.Duration)(o.MinRetryBackoff), &o.o.MinRetryBackoff)
+	o.o.MaxRetryBackoff = *w.DefaultPointer[time.Duration]((*time.Duration)(o.MaxRetryBackoff), &o.o.MaxRetryBackoff)
+	o.o.DialTimeout = *w.DefaultPointer[time.Duration]((*time.Duration)(o.DialTimeout), &o.o.DialTimeout)
+	o.o.ReadTimeout = *w.DefaultPointer[time.Duration]((*time.Duration)(o.ReadTimeout), &o.o.ReadTimeout)
+	o.o.WriteTimeout = *w.DefaultPointer[time.Duration]((*time.Duration)(o.WriteTimeout), &o.o.WriteTimeout)
+	o.o.PoolSize = *w.DefaultPointer(o.PoolSize, &o.o.PoolSize)
+	o.o.MinIdleConns = *w.DefaultPointer(o.MinIdleConns, &o.o.MinIdleConns)
+	o.o.MaxConnAge = *w.DefaultPointer(o.MaxConnAge, &o.o.MaxConnAge)
+	o.o.PoolTimeout = *w.DefaultPointer(o.PoolTimeout, &o.o.PoolTimeout)
+	o.o.IdleTimeout = *w.DefaultPointer(o.IdleTimeout, &o.o.IdleTimeout)
+	o.o.IdleCheckFrequency = *w.DefaultPointer(o.IdleCheckFrequency, &o.o.IdleCheckFrequency)
+	if o.TLSConfig != nil {
+		tlsConfig, err := tls.NewTLSConfig(o.TLSConfig)
+		if err != nil {
+			return err
+		}
+		o.o.TLSConfig = tlsConfig
+	}
+	return nil
+}
+
+// NewClient connects using option and returns a tracing Client.
+func NewClient(ctx context.Context, option *Options) (*Client, error) {
+	client, err := NewRedisClient(ctx, option)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{client: client, options: option}, nil
+}
+
+// NewRedisClient connects using option and returns a go-redis Client.
+// The process signal handler closes the connection on shutdown.
+func NewRedisClient(ctx context.Context, option *Options) (*redis.Client, error) {
+	var err error
+	logger := log.GetContextLogger(ctx)
+	o := *option.o
+	o.Password, err = option.Password.UnsafeString()
+	if err != nil {
+		return nil, err
+	}
+	level.Debug(logger).Log("msg", "connect to redis server", "host", o.Addr, "db", o.DB)
+	client := redis.NewClient(&o)
+	if err = client.Ping().Err(); err != nil {
+		level.Error(logger).Log("msg", "Redis connection failed", "err", err)
+		_ = client.Close()
+		return nil, err
+	}
+
+	level.Info(logger).Log("msg", "connected to redis server", "host", option.o.Addr, "db", option.o.DB)
+	stopCh := signals.SetupSignalHandler(logger)
+	stopCh.PreStop(signals.LevelDB, func() {
+		if err = client.Close(); err != nil {
+			level.Error(logger).Log("msg", "Redis client shutdown error", "err", err)
+			time.Sleep(1 * time.Second)
+		}
+		level.Debug(logger).Log("msg", "Closed Redis connection")
+	})
+	return client, nil
+}
+
+// GetPeer returns the hostname and port parsed from URL.
+func (o *Options) GetPeer() (string, int) {
+	u, err := url.Parse(o.URL)
+	if err != nil {
+		return "", 0
+	}
+	port, _ := strconv.Atoi(u.Port())
+	return u.Hostname(), port
+}
+
+func parseArg(v interface{}) (string, error) {
+	switch v := v.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	case int:
+		return strconv.Itoa(v), nil
+	case int8:
+		return strconv.Itoa(int(v)), nil
+	case int16:
+		return strconv.Itoa(int(v)), nil
+	case int32:
+		return strconv.Itoa(int(v)), nil
+	case int64:
+		return strconv.FormatInt(v, 10), nil
+	case uint:
+		return strconv.FormatUint(uint64(v), 10), nil
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10), nil
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10), nil
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10), nil
+	case uint64:
+		return strconv.FormatUint(v, 10), nil
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 64), nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	case encoding.BinaryMarshaler:
+		b, err := v.MarshalBinary()
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	default:
+		return "", fmt.Errorf(
+			"redis: can't marshal %T (implement encoding.BinaryMarshaler)", v)
+	}
+}
+
+// Cmder wraps redis.Cmder so String renders a space-separated command line.
+type Cmder struct {
+	redis.Cmder
+}
+
+// String returns the Redis command and arguments as a single line.
+func (c Cmder) String() string {
+	var buf bytes.Buffer
+	for idx, arg := range c.Args() {
+		if idx != 0 {
+			buf.WriteString(" ")
+		}
+		if s, err := parseArg(arg); err != nil {
+			buf.Write(w.M(json.Marshal(fmt.Sprintf("<%s>", err))))
+		} else {
+			buf.WriteString(s)
+		}
+	}
+	return buf.String()
+}
+
+const instrumentationName = "github.com/sven-victor/ez-utils/clients/redis"
+
+// Redis returns a context-bound client that traces and logs each command.
+func (r *Client) Redis(ctx context.Context) *redis.Client {
+	tracer := otel.GetTracerProvider().Tracer(instrumentationName)
+	logger := log.GetContextLogger(ctx, log.WithCaller(7))
+	session := r.client.WithContext(ctx)
+	host, port := r.options.GetPeer()
+	session.WrapProcess(func(oldProcess func(cmd redis.Cmder) error) func(cmd redis.Cmder) error {
+		return func(cmd redis.Cmder) (err error) {
+			_, span := tracer.Start(ctx, "ExecuteRedisCommand."+cmd.Name(),
+				trace.WithAttributes(
+					attribute.String("db.info", r.client.String()),
+					attribute.String("net.peer.name", host),
+					attribute.Int("net.peer.port", port),
+					attribute.String("db.statement", (&Cmder{Cmder: cmd}).String()),
+					attribute.String("db.system", "redis"),
+				),
+			)
+			defer func() {
+				span.End()
+				if err != nil {
+					if err != redis.Nil {
+						span.SetStatus(codes.Error, err.Error())
+						level.Error(logger).Log("msg", "failed to exec Redis Command", "cmd", Cmder{Cmder: cmd}, "err", err)
+					} else {
+						span.SetStatus(codes.Error, err.Error())
+						level.Debug(logger).Log("msg", "failed to exec Redis Command", "cmd", Cmder{Cmder: cmd}, "err", err)
+					}
+				} else {
+					span.SetStatus(codes.Ok, "")
+					level.Debug(logger).Log("msg", "exec Redis Command", "cmd", Cmder{Cmder: cmd})
+				}
+			}()
+			return oldProcess(cmd)
+		}
+	})
+	return session
+}
+
+// Close closes the underlying Redis connection.
+func (r Client) Close() error {
+	return r.client.Close()
+}
+
+// ErrStopLoop tells ForeachSet to stop iterating without returning an error.
+var ErrStopLoop = errors.New("stop")
+
+// ForeachSet scans members of the Redis set at key and calls f for each member.
+// pageSize defaults to 100 when 0. Return ErrStopLoop from f to stop early.
+func ForeachSet(ctx context.Context, c *redis.Client, key string, cursor uint64, pageSize int64, f func(key, val string) error) (err error) {
+	var listLength int64
+	if ret, err := c.SCard(key).Result(); err != nil {
+		return err
+	} else if listLength = ret; listLength == 0 {
+		return nil
+	}
+	if pageSize == 0 {
+		pageSize = 100
+	}
+	var ret []string
+	for {
+		select {
+		case <-ctx.Done():
+		default:
+			ret, cursor, err = c.SScan(key, cursor, "*", pageSize).Result()
+			if err != nil {
+				return err
+			}
+			for _, member := range ret {
+				if err = f(key, member); err != nil {
+					if err == ErrStopLoop {
+						break
+					}
+					return err
+				}
+			}
+			if int64(len(ret)) < pageSize {
+				return nil
+			}
+		}
+	}
+}

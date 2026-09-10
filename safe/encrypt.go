@@ -1,0 +1,329 @@
+// Package safe provides encryption, hashing, and secret-string helpers.
+package safe
+
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/des"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"golang.org/x/crypto/tea" //nolint:staticcheck
+)
+
+// SecretEnvName is the environment variable that holds the default encryption key.
+var SecretEnvName = "GLOBAL_ENCRYPT_KEY"
+
+func init() {
+	key := os.Getenv(SecretEnvName)
+	switch len(key) {
+	default:
+		fmt.Printf("Crypto: invalid key size %d, please check the environment variable `%s`.\n", len(key), SecretEnvName)
+		os.Exit(1)
+	case 0, 8, 16, 24, 32:
+		break
+	}
+}
+
+func pkcs5Padding(data []byte, blockSize int) ([]byte, int) {
+	padding := blockSize - len(data)%blockSize
+	slice1 := []byte{byte(padding)}
+	slice2 := bytes.Repeat(slice1, padding)
+	return append(data, slice2...), padding
+}
+
+// EncryptOptions selects the algorithm, block mode, and padding used by Encrypt.
+type EncryptOptions struct {
+	algo    EncryptionAlgorithm
+	mode    BlockMode
+	padding PaddingMethod
+	fixAlgo bool
+}
+
+// NewEncryptOptions returns EncryptOptions with 3DES, CBC, and PKCS5 defaults, then applies ofs.
+func NewEncryptOptions(ofs ...WithOptionsFunc) *EncryptOptions {
+	o := EncryptOptions{algo: Algorithm3DES, mode: BlockModeCBC, padding: PKCS5Padding, fixAlgo: false}
+	for _, of := range ofs {
+		of(&o)
+	}
+	return &o
+}
+
+// WithOptionsFunc mutates EncryptOptions before encryption.
+type WithOptionsFunc func(o *EncryptOptions)
+
+// WithAlgorithm returns a WithOptionsFunc that selects algo.
+func WithAlgorithm(algo EncryptionAlgorithm) WithOptionsFunc {
+	return func(o *EncryptOptions) {
+		o.algo = algo
+	}
+}
+
+// WithMode returns a WithOptionsFunc that selects the block mode.
+func WithMode(mode BlockMode) WithOptionsFunc {
+	return func(o *EncryptOptions) {
+		o.mode = mode
+	}
+}
+
+// WithPadding returns a WithOptionsFunc that selects the padding method.
+func WithPadding(padding PaddingMethod) WithOptionsFunc {
+	return func(o *EncryptOptions) {
+		o.padding = padding
+	}
+}
+
+// WithFixAlgo enables adjusting the algorithm to match the key length.
+func WithFixAlgo(o *EncryptOptions) {
+	o.fixAlgo = true
+}
+
+// WithoutFixAlgo disables adjusting the algorithm to match the key length.
+func WithoutFixAlgo(o *EncryptOptions) {
+	o.fixAlgo = false
+}
+
+func fixAlgo(key string, o *EncryptOptions) string {
+	switch len(key) {
+	case 8:
+		if o.algo != AlgorithmDES {
+			o.algo = AlgorithmDES
+		}
+	case 16:
+		if o.algo != AlgorithmAES && o.algo != AlgorithmTEA {
+			o.algo = AlgorithmAES
+		}
+	case 24:
+		if o.algo != AlgorithmAES && o.algo != Algorithm3DES {
+			o.algo = Algorithm3DES
+		}
+	case 32:
+		if o.algo != AlgorithmAES {
+			o.algo = AlgorithmAES
+		}
+	default:
+		fixKey := NewHash(sha256.New, []byte(key))
+		if o.algo != AlgorithmAES {
+			o.algo = AlgorithmAES
+		}
+		return string(fixKey)
+	}
+	return key
+}
+
+// Encrypt encrypts originalBytes with key and returns a prefixed ciphertext string.
+func Encrypt(originalBytes []byte, key string, o *EncryptOptions) (string, error) {
+	if o == nil {
+		o = NewEncryptOptions(WithFixAlgo)
+	}
+	if o.fixAlgo {
+		key = fixAlgo(key, o)
+	}
+	block, err := o.algo.NewCipher([]byte(key))
+	if err != nil {
+		return "", err
+	}
+	blockSize := block.BlockSize()
+	paddingBytes, paddingLength, err := o.padding.Padding(originalBytes, blockSize)
+	if err != nil {
+		return "", err
+	}
+	iv := make([]byte, blockSize)
+	_, err = rand.Read(iv)
+	if err != nil {
+		return "", err
+	}
+	args := []byte{byte(o.mode)<<4 | byte(o.padding), 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(args[1:5], uint32(paddingLength))
+	if len(iv) >= 5 {
+		args[0] = iv[0] ^ args[0]
+		args[1] = iv[1] ^ args[1]
+		args[2] = iv[2] ^ args[2]
+		args[3] = iv[3] ^ args[3]
+		args[4] = iv[4] ^ args[4]
+	}
+	args = append(args, iv...)
+	blockMode := o.mode.NewEncrypter(block, iv)
+	cipherBytes := make([]byte, len(paddingBytes))
+	blockMode.CryptBlocks(cipherBytes, paddingBytes)
+	prefix := fmt.Sprintf("%s$%s$%s$", ciphertextPrefix, o.algo, base64.StdEncoding.WithPadding(base64.NoPadding).EncodeToString(args))
+	return prefix + base64.StdEncoding.WithPadding(base64.NoPadding).EncodeToString(cipherBytes), nil
+}
+
+const ciphertextPrefix = "{CRYPT}"
+
+// Decrypt decrypts a string produced by Encrypt and returns the original bytes.
+func Decrypt(cipherString, key string) ([]byte, error) {
+	switch len(key) {
+	case 8, 16, 24, 32:
+	default:
+		key = string(NewHash(sha256.New, []byte(key)))
+	}
+	if len(cipherString) <= len(ciphertextPrefix)+5 {
+		return nil, errors.New("invalid ciphertext")
+	}
+	if !strings.HasPrefix(cipherString, ciphertextPrefix) ||
+		cipherString[len(ciphertextPrefix)] != '$' {
+		return nil, errors.New("invalid ciphertext")
+	}
+
+	buf := bytes.NewBufferString(cipherString[len(ciphertextPrefix)+1:])
+	var algo EncryptionAlgorithm
+	{
+		if algoStr, err := buf.ReadString('$'); err != nil {
+			return nil, err
+		} else if len(algoStr) < 1 || len(algoStr) > 3 {
+			return nil, errors.New("invalid encryption algorithm: " + strings.TrimSuffix(algoStr, "$"))
+		} else {
+			algoStr = algoStr[:len(algoStr)-1]
+			if len(algoStr) == 1 {
+				algoStr = "0" + algoStr
+			}
+			algos, err := hex.DecodeString(algoStr)
+			if err != nil {
+				return nil, err
+			}
+			algo = EncryptionAlgorithm(algos[0])
+		}
+	}
+	block, err := algo.NewCipher([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	args, err := buf.ReadBytes('$')
+	if err != nil {
+		return nil, err
+	}
+	args = bytes.TrimSuffix(args, []byte("$"))
+	args, err = base64.StdEncoding.WithPadding(base64.NoPadding).DecodeString(string(args))
+	if err != nil {
+		return nil, err
+	}
+
+	iv := args[5:]
+	if len(iv) >= 5 {
+		args[0] = iv[0] ^ args[0]
+		args[1] = iv[1] ^ args[1]
+		args[2] = iv[2] ^ args[2]
+		args[3] = iv[3] ^ args[3]
+		args[4] = iv[4] ^ args[4]
+	}
+	mode := BlockMode(args[0] >> 4)
+	padding := PaddingMethod(args[0] & 0x0F)
+
+	s := buf.String()
+	cipherBytes, err := base64.StdEncoding.WithPadding(base64.NoPadding).DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	blockMode := mode.NewDecrypter(block, iv)
+	paddingBytes := make([]byte, len(cipherBytes))
+	blockMode.CryptBlocks(paddingBytes, cipherBytes)
+	paddingLength := int(binary.BigEndian.Uint32(args[1:5]))
+	originalBytes, err := padding.UnPadding(paddingBytes, paddingLength)
+	if err != nil {
+		return nil, err
+	}
+	return originalBytes, nil
+}
+
+// EncryptionAlgorithm identifies a block cipher used by Encrypt and Decrypt.
+type EncryptionAlgorithm byte
+
+// String returns a short hex identifier for the algorithm.
+func (algo EncryptionAlgorithm) String() string {
+	return strings.ToUpper(strings.TrimPrefix(hex.EncodeToString([]byte{byte(algo)}), "0"))
+}
+
+const (
+	// Algorithm3DES is Triple DES.
+	Algorithm3DES EncryptionAlgorithm = 0
+	// AlgorithmDES is DES.
+	AlgorithmDES EncryptionAlgorithm = 1
+	// AlgorithmAES is AES.
+	AlgorithmAES EncryptionAlgorithm = 2
+	// AlgorithmTEA is TEA.
+	AlgorithmTEA EncryptionAlgorithm = 3
+)
+
+// NewCipher returns a cipher.Block for algo using key.
+func (algo EncryptionAlgorithm) NewCipher(key []byte) (cipher.Block, error) {
+	var err error
+	var block cipher.Block
+	switch algo {
+	case AlgorithmDES:
+		block, err = des.NewCipher(key)
+	case Algorithm3DES:
+		block, err = des.NewTripleDESCipher(key)
+	case AlgorithmAES:
+		block, err = aes.NewCipher(key)
+	case AlgorithmTEA:
+		block, err = tea.NewCipher(key)
+	default:
+		return nil, fmt.Errorf("unknown encryption algorithm 0x%X", algo)
+	}
+	return block, err
+}
+
+// BlockMode identifies a block-cipher mode of operation.
+type BlockMode byte
+
+const (
+	// BlockModeCBC is Cipher Block Chaining mode.
+	BlockModeCBC = 0x00
+)
+
+// NewEncrypter returns a cipher.BlockMode that encrypts with b and iv.
+func (g BlockMode) NewEncrypter(b cipher.Block, iv []byte) cipher.BlockMode {
+	switch g {
+	case BlockModeCBC:
+		return cipher.NewCBCEncrypter(b, iv)
+	}
+	return nil
+}
+
+// NewDecrypter returns a cipher.BlockMode that decrypts with b and iv.
+func (g BlockMode) NewDecrypter(b cipher.Block, iv []byte) cipher.BlockMode {
+	switch g {
+	case BlockModeCBC:
+		return cipher.NewCBCDecrypter(b, iv)
+	}
+	return nil
+}
+
+// PaddingMethod identifies how plaintext is padded to a block-size multiple.
+type PaddingMethod byte
+
+const (
+	// PKCS5Padding pads data to a multiple of the block size using PKCS#5/PKCS#7.
+	PKCS5Padding PaddingMethod = 0x00
+)
+
+// Padding appends padding bytes so that data is a multiple of blockSize.
+func (p PaddingMethod) Padding(data []byte, blockSize int) ([]byte, int, error) {
+	switch p {
+	case PKCS5Padding:
+		newData, paddingLength := pkcs5Padding(data, blockSize)
+		return newData, paddingLength, nil
+	default:
+		return nil, 0, fmt.Errorf("unknown padding 0x%X", p)
+	}
+}
+
+// UnPadding removes paddingLength bytes from the end of data.
+func (p PaddingMethod) UnPadding(data []byte, paddingLength int) ([]byte, error) {
+	switch p {
+	case PKCS5Padding:
+		return data[:(len(data) - int(paddingLength))], nil
+	default:
+		return nil, fmt.Errorf("unknown padding 0x%X", p)
+	}
+}
